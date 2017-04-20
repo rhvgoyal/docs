@@ -1,0 +1,190 @@
+Structure of data placement
+==========================
+- Super block is 512 bytes.
+
+- In the beginning 1K reserved. I think 512 bytes for super block and another
+  512 bytes for some sort of redundant super block.
+
+- Then Some fixed inodes are stored. Each inode size is 128 bytes.
+  - NOVA_ROOT_INO           (1)
+  - NOVA_INODETABLE_INO     (2)     /* Temporaty inode table */
+  - NOVA_BLOCKNODE_INO      (3)
+  - NOVA_INODELIST_INO      (4)
+  - NOVA_LITEJOURNAL_INO    (5)
+  - NOVA_INODELIST1_INO     (6)
+
+- One can get virtual address of these fixed inodes using nova_get_inode_by_ino()
+
+Inode Table
+===========
+- There are per cpu inode tables.
+
+- Pointers to all per cpu inode tables are stored at offset of 8192 bytes.
+
+- During init, a 2MB block is allocated for each inode table and pointer is
+  set according to where 2MB block has been allocated. nova_init_inode_table()
+
+- At the offset of 8192 bytes (NOVA_DEF_BLOCK_SIZE_4K * 2), per cpu inode
+  table seems to be stored. Size for each cpu seems to be 64 bytes.
+  (CACHELINE_SIZE).  nova_get_inode_table().
+
+- Each inode size is 128 bytes (7 bits). These inodes are packed sequetially
+  in 2BM page. And are indexed by inode number.
+
+- When 2MB page can not represent inode, another 2MB block is allocated and
+  its pointer is stored in last 8 bytes of previous block.
+
+- nova_get_inode_address() can take an inode and return virtual address in
+  persistent memory for inode. If extendabale is set to 1, then it can also
+  allocate all the needed 2MB inode table pages in the path (if inode does not
+  exist already).
+
+Inode In Use RB tree
+====================
+- There is in RAM RB tree to keep track of in use inodes. And same tree is
+  use to allocate new inodes.
+
+- There see to be one such RB tree per cpu, stored at sbi->inode_maps[i]
+
+- This tree is initialied in nova_init_inode_inuse_list()
+
+Journal
+========
+- There are per cpu journals. Each journal is represented by a pair of
+  pointers. Head pointer and tail pointer.
+
+- These journal pointers are located at fixed offset of 4096 bytes.
+  (nova_get_journal_pointers())
+
+- Each journal seems to be of size 4K which is allocated dynamically.
+  (nova_lite_journal_hard_init())
+
+- Each journal entry is of size 8 * 64 bytes. And is of following form.
+
+  struct nova_lite_journal_entry {
+        /* The highest byte of addr is type */
+        u64 addrs[4];
+        u64 values[4];
+  };
+
+- It can store 4 address-value pairs and during recovery, it can rollback
+  transaction. That is write those values to addresses as specified in
+  transaction.
+
+- Currently journal allows creation of at max two uncommitted entries.
+
+- Workflow is as follows.
+
+  nova_create_lite_transaction() <--- create transaction
+  make changes
+  nova_commit_lite_transaction() <----- commit transaction
+
+Free Space Map
+===============
+- Space map is managed in the form of a red black tree in DRAM. Each node
+  in tree represents a range of free blocks.
+
+- At the time of shutdown, space map is saved in the logs of a special inode.
+  I think this inode is NOVA_BLOCKNODE_INO. And during later mount we restore
+  red black tree from logs of this inode.
+
+- Entries in logs are of the form of nova_range_node_lowhigh{}. It contains
+  two 64bit values. First value (range_low), represents start of free range
+  and second value (range_high), represents end of range.
+
+- If system crashed, at free space map could not be saved, then full map is
+  resonstructed from all the inode logs.
+
+Free Space Red Black Tree
+=========================
+- Per cpu free lists are maintaintained.
+
+- Freeing block seems to allocate a rb tree node. And if that fails, then it
+  returns without freeing blocks.
+
+Per Directory Radix Tree for file inode lookup
+==============================================
+- Nova maintains a per directory radix tree to looking up files/dir it
+  has. This tree is built when directory is first looked up in nova_lookup().
+
+- nova_find_dentry() function takes name of entry to look for in directory.
+  It calculates the hash from name and then uses that hash as key to
+  lookup in directory radix tree.
+
+  direntry = radix_tree_lookup(&sih->tree, hash)
+
+- This tree is built during directory inode rebuild.
+  nova_rebuild_dir_inode_tree(). This function basically goes through all
+  the directory logs and builds this radix tree.
+
+Per file inode radix tree for file block mapping
+================================================
+- Nova maintains a per inode (for file), radix tree to map file offsets
+  to real blocks.
+
+- This tree is rebuilt when inode is looked up. nova_rebuild_file_inode_tree()
+
+- Nova goes through inode logs, looks for entry types FILE_WRITE and adds
+  these entries to radix tree.
+
+  radix_tree_insert(&sih->tree, curr_pgoff, entry);
+
+  I think file offset is the key and entry (struct nova_file_write_entry *) is
+  the value.
+
+Write to a file workflow
+========================
+- nova_dax_file_write() is installed as ->write method in "struct file_operations" structure.
+
+- nova_cow_file_write() does the actual job of allocating blocks, copying
+  data from user space to blocks, preparing log entries and finally updating
+  the inode log tail pointer.
+
+- One file_write_entry is prepared for one range of contiguous blocks
+  allocated. And this is repeated till user requested number of blocks
+  are written.
+
+- nova_append_file_write_entry() takes care of appending file_write_entry
+  to inode log.
+
+- Once all the entries have been appended, in the end, log tail pointer
+  is updated with a call to nova_update_tail().
+
+- After updating tail, nova looks for any overwrites. Tracks down the log
+  entries representing those overwrites. Updates invalid_page count of these
+  entries and updates radix tree (mapping pageoff to log entry).
+
+  nova_reassign_file_tree()
+
+- nova_assign_write_entry(), take one file_write_entry, goes through its
+  pages/blocks and figures out which ones might be overlapping with an
+  existing file_write_entry.  It updates existing entry's ->invalid_pages
+  entry and installs new file_write_entry in the radix tree.
+
+  If there are no overlapping pages, it simply installs this new entry for
+  every page entry is representing.
+-
+
+Questions and Observations
+==========================
+- Nova seems to allocate data structures per cpu. And all this seems to be
+  static. That is, if cpu is onlined, nova will not adjust to it.
+
+- Still try to figure out why logging per inode is better than journaling
+  or shadow page mechanism. They seem to claim that it is more performant.
+
+- Isn't going through all the logs expensive when file gets old after lot
+  of operations.
+  - There is also notion of marking log entries dead which are not valid
+    anymore. So number of log entries in a file are roughly equal to file
+    extents. I think one file_write_entry for each extent.
+
+- nova_reassign_file_tree(), updates invalid_pages of old entry. Now how
+  do we know which blocks of old_entry are still valid. And during a full
+  recovery how do we figure out which are actually free blocks.
+
+- In per inode radix tree (mapping page offset to file_write_entry), looks
+  like there is index for every valid page in file. Is that efficient. IOW,
+  if a file_write_entry, presents 1000 pages, then all 1000 pages will have
+  entries in tree pointing to same file_write_entry. Look into this.
+
